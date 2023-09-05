@@ -1,134 +1,694 @@
 trigger:
-- master
-- releases/*
-- node6hotfixes/*
-
+  branches:
+    include:
+    - master
+    - releases/*
+    - node6hotfixes/*
 resources:
   repositories:
   - repository: AzureDevOps
     type: git
     endpoint: AzureDevOps
     name: AzureDevOps/AzureDevOps
+  - repository: ConfigChange
+    type: git
+    endpoint: AzureDevOps
+    name: AzureDevOps/AzureDevOps.ConfigChange
+parameters:
+- name: build_single_task
+  displayName: Build Single Task
+  type: boolean
+  default: false
+- name: task_name
+  displayName: Task Name
+  type: string
+  default: TaskNameVN
+- name: push_to_feed
+  displayName: Push to Feed
+  type: boolean
+  default: false
+- name: generate_prs
+  displayName: Create hotfix PRs and Release
+  type: boolean
+  default: false
+variables:
+- name: currentDate
+  value: $[ format('{0:yyyy}{0:MM}{0:dd}', pipeline.startTime) ]
+stages:
+- stage: __default
+  jobs:
+  - job: build_all_windows
+    displayName: Build all tasks (Windows)
+    condition: eq(variables.os, 'Windows_NT')
+    timeoutInMinutes: 180
+    pool:
+      vmImage: windows-2022
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        clean: true
+    - task: PowerShell@2
+      displayName: Start collect diagnostics
+      condition: and(succeeded(), eq(variables.collect_diagnostics, 'true'))
+      inputs:
+        targetType: inline
+        script: ./ci/start-collect-diagnostics.ps1
+    - task: NodeTool@0
+      displayName: Use node 10
+      inputs:
+        versionSpec: 10.24.1
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK 7.x'
+      inputs:
+        version: 7.x
+    - task: CmdLine@2
+      displayName: npm install
+      inputs:
+        script: npm install
+    - task: CmdLine@2
+      displayName: npm install min agent demands
+      inputs:
+        script: |
+          cd ci/verifyMinAgentDemands
+          npm install
+    - task: CmdLine@2
+      displayName: Verify min agent demands
+      inputs:
+        script: node ./ci/verifyMinAgentDemands/index.js
+    - task: PowerShell@2
+      displayName: Fetch current sprint
+      inputs:
+        targetType: inline
+        script: |
+          $currentSprintData = (Invoke-WebRequest https://whatsprintis.it -Headers @{"Accept"="application/json"} | ConvertFrom-Json)
+          $currentSprint = [int]$currentSprintData.sprint
+          $currentSprintWeek = [int]$currentSprintData.week
+          echo "##vso[task.setvariable variable=currentSprint;]$currentSprint"
+          echo "##vso[task.setvariable variable=currentSprintWeek;]$currentSprintWeek"
+    - task: CmdLine@2
+      displayName: Filter out unchanged tasks
+      env:
+        PACKAGE_ENDPOINT: $(Package.Endpoint)
+        PACKAGE_TOKEN: $(Package.Token)
+      inputs:
+        script: node ./ci/filter-tasks.js
+    - task: CmdLine@2
+      displayName: Check that tasks has no duplicated libs
+      condition: and(succeeded(), eq(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/before-build-check-tasks.js
+    - task: CmdLine@2
+      displayName: Check for downgrading tasks
+      condition: |
+        and(
+          succeeded(),
+          ne(variables['numTasks'], 0),
+          ne(variables['COURTESY_PUSH'], 'true'),
+          eq(variables['build.reason'], 'PullRequest'),
+          eq(variables['System.PullRequest.TargetBranch'], 'master')
+        )
+      env:
+        PACKAGE_TOKEN: $(Package.Token)
+      inputs:
+        script: node ./ci/check-downgrading.js --task "$(task_pattern)" --sprint $(currentSprint) --week $(currentSprintWeek)
+    - task: DotNetCoreCLI@2
+      displayName: Build BuildConfigGen
+      inputs:
+        command: build
+        projects: './BuildConfigGen/BuildConfigGen.csproj'
+    - task: CmdLine@2
+      displayName: Clean tasks
+      inputs:
+        script: node make.js clean
+    - task: CmdLine@2
+      displayName: Build Tasks
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js serverBuild --task "$(task_pattern)"
+    - task: CmdLine@2
+      displayName: Check that tasks has no duplicated libs
+      condition: and(succeeded(), eq(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/after-build-check-tasks.js
+    - task: CmdLine@2
+      displayName: Verify task source changes
+      condition: "and(\n  succeeded(),\n  ne(variables['Build.SourceBranch'], 'refs/heads/master'),     \n  ne(variables['COURTESY_PUSH'], 'true'),\n  ne(variables['numTasks'], 0)\n)\n"
+      inputs:
+        script: node ./ci/verify-source-changes.js "$(task_pattern)"
+    - task: CmdLine@2
+      displayName: Stage tasks individually into the package directory
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/stage-package.js false individually
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK 6.x'
+      inputs:
+        version: 6.x
+    - task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@2
+      inputs:
+        ConnectedServiceName: AzurePipelinesTasksESRP
+        FolderPath: $(Build.SourcesDirectory)\_package\tasks-layout
+        Pattern: '*.zip'
+        signConfigType: inlineSignParams
+        inlineOperation: |
+          [{
+          "keyCode": "CP-401405",
+          "operationSetCode": "NuGetSign",
+          "parameters": [],
+          "toolName": "sign",
+          "toolVersion": "1.0"
+          },
+          {
+          "keyCode": "CP-401405",
+          "operationSetCode": "NuGetVerify",
+          "parameters": [],
+          "toolName": "sign",
+          "toolVersion": "1.0"
+          }
+          ]
+      displayName: Sign Task Nuget Packages
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0), eq(variables.os, 'Windows_NT'))
+    - task: CmdLine@2
+      displayName: Remove CodeSignSummary file from package folder
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0), eq(variables.os, 'Windows_NT'))
+      inputs:
+        script: del $(Build.SourcesDirectory)\_package\tasks-layout\CodeSignSummary*.md
+    - task: CmdLine@2
+      displayName: Stage all the tasks into a single zip for upload
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/stage-package.js false
+    - task: PublishBuildArtifacts@1
+      displayName: Publish package artifact
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        pathToPublish: _package/tasks.zip
+        artifactName: package
+        publishLocation: container
+    - task: CmdLine@2
+      displayName: Run tests
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js test
+    - task: CmdLine@2
+      displayName: Legacy tests with node 6
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js testLegacy --task "$(task_pattern)"
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish Code Coverage Results
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(System.DefaultWorkingDirectory)/_build/coverage/*coverage.xml
+    - task: PowerShell@2
+      displayName: Stop collect diagnostics
+      condition: and(always(), eq(variables.collect_diagnostics, 'true'), ne(variables['numTasks'], 0))
+      inputs:
+        targetType: inline
+        script: ./ci/stop-collect-diagnostics.ps1
+    - task: PowerShell@2
+      condition: |
+        and(
+          succeeded(),
+          in(variables['build.reason'], 'Schedule', 'Manual'),
+          eq(variables['COURTESY_PUSH'], 'true'),
+          eq(variables['Build.SourceBranch'], 'refs/heads/master')
+        )
+      displayName: Push release branch
+      inputs:
+        targetType: inline
+        script: |
+          # Build the release branch name
+          $releaseBranch = "releases/m" + $(currentSprint) + "." + $(currentDate)
 
-jobs:
+          # add config entry to avoid errors while pulling
+          git config --global user.email "$(username)@microsoft.com"
+          git config --global user.name "$(username)"
 
-# All tasks on Windows
-- job: build_all_windows
-  displayName: Build all tasks (Windows)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Windows_NT'))
-  pool:
-    vmImage: vs2017-win2016
-  timeoutInMinutes: 120
-  steps:
-  - template: ci/build-all-steps.yml
-    parameters:
-      os: Windows_NT
+          # Pull commits from remote and push branch to git
+          git checkout -b $releaseBranch
+          Write-Host 'Trying to pull the remote branch..'
+          git pull https://$(GitHubPAT)@github.com/microsoft/azure-pipelines-tasks $releaseBranch
+          if (-not $?) {
+            Write-Host 'Failed to pull the remote branch. This is expected if the remote branch doesn't exist.
+          }
+          Write-Host 'Trying to push to the remote branch..'
+          git push https://$(GitHubPAT)@github.com/microsoft/azure-pipelines-tasks $releaseBranch
+    - task: PowerShell@2
+      condition: |
+        and(
+          succeeded(),
+          in(variables['build.reason'], 'Schedule', 'Manual'),
+          eq(variables['COURTESY_PUSH'], 'true'),
+          eq(variables['Build.SourceBranch'], 'refs/heads/master')
+        )
+      displayName: Create Release
+      inputs:
+        targetType: inline
+        script: |
+          # Build the release branch name
+          $releaseBranch = "releases/m" + $(currentSprint) + "." + $(currentDate)
 
-# Publish on Windows
-- job: publish_windows
-  displayName: Publish
-  dependsOn:
-  - build_all_windows
-  condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), eq(variables.os, 'Windows_NT'))
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - template: ci/publish-steps.yml
+          if ($(currentSprintWeek) -eq 3) {
+            cd $(System.DefaultWorkingDirectory)/ci/ci-release-notes
+            npm install
+            node release-notes.js --token $(GitHubPAT) --version $(currentSprint) --releaseBranch $releaseBranch
+          } else {
+            echo "Skipping since release notes generating on week 3"
+          }
+  - job: publish
+    displayName: Publish
+    dependsOn:
+    - build_all_windows
+    condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'))
+    pool:
+      vmImage: windows-2022
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        clean: true
+    - task: NodeTool@0
+      displayName: Use node 10
+      inputs:
+        versionSpec: 10.x
+    - task: NuGetToolInstaller@0
+      displayName: Use NuGet 6
+      inputs:
+        versionSpec: 6.0.0
+    - task: CmdLine@2
+      displayName: npm install
+      inputs:
+        script: npm install
+    - task: PowerShell@2
+      displayName: Set publish variables
+      inputs:
+        targetType: inline
+        script: .\ci\set-publish-variables.ps1
+    - task: PowerShell@2
+      displayName: Download built packages
+      env:
+        SYSTEM_ACCESSTOKEN: $(system.accessToken)
+      inputs:
+        targetType: inline
+        script: .\ci\download-built.ps1
+    - task: CmdLine@2
+      displayName: Stage milestone
+      inputs:
+        script: node .\ci\stage-milestone.js
+    - task: CmdLine@2
+      displayName: npm run package
+      env:
+        COURTESY_PUSH: $(courtesyPush)
+      inputs:
+        script: npm run package
+    - task: PublishBuildArtifacts@1
+      displayName: Publish per task NuGet package artifact
+      inputs:
+        pathToPublish: _package/nuget-packages
+        artifactName: IndividualNuGetPackages
+        publishLocation: container
+    - task: PowerShell@2
+      displayName: Update build number
+      inputs:
+        targetType: inline
+        script: |
+          Write-Host "##vso[build.updatebuildnumber]$(aggregate_version)"
+  - job: courtesy_push
+    displayName: Courtesy Push
+    dependsOn:
+    - publish
+    condition: |
+      and(succeeded(), eq(variables['COURTESY_PUSH'], 'true'), or(
+        eq(variables['build.reason'], 'Schedule'),
+        and(eq(variables['build.reason'], 'Manual'), eq(variables['FORCE_COURTESY_PUSH'], 'true'))
+      ))
+    pool:
+      vmImage: windows-2022
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: AzureDevOps
+        fetchDepth: 1
+        persistCredentials: true
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+    - task: NuGetToolInstaller@0
+      inputs:
+        versionSpec: 6.0.0
+      displayName: Install nuget
+    - task: DownloadBuildArtifacts@0
+      inputs:
+        artifactName: IndividualNugetPackages
+        downloadPath: IndividualNugetPackagesDownloaded
+      displayName: Download Artifact
+    - task: CmdLine@2
+      displayName: Update unified deps
+      inputs:
+        script: node azure-pipelines-tasks\ci\courtesy-push\courtesy-push.js AzureDevOps IndividualNugetPackagesDownloaded\IndividualNugetPackages\unified_deps.xml
+    - task: NuGetAuthenticate@0
+      displayName: Authenticate with nuget
+    - task: CmdLine@2
+      displayName: Push Nuget packages
+      inputs:
+        script: |
+          cd IndividualNugetPackagesDownloaded
+          cd IndividualNugetPackages
+          push.cmd
+    - task: PowerShell@2
+      displayName: Create PR in Azure DevOps
+      env:
+        TOKEN: $(Package.Token)
+      inputs:
+        targetType: inline
+        script: |
+          # Build the release branch name
+          $currentSprint = (Invoke-WebRequest https://whatsprintis.it/sprint -Headers @{"Accept"="application/json"} | ConvertFrom-Json).sprint
+          $releaseBranch = "users/$(username)/m" + $currentSprint + "." + $(currentDate) + "/courtesyPush"
 
-# Courtesy push on Windows
-- job: courtesy_push_windows
-  displayName: Courtesy Push
-  dependsOn:
-  - publish_windows
-  condition: and(succeeded(), in(variables['build.reason'], 'Schedule', 'Manual'), eq(variables['COURTESY_PUSH'], 'true'))
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - powershell: |
-      $week = (Invoke-WebRequest https://whatsprintis.it -Headers @{"Accept"= "application/json"} | ConvertFrom-Json).week
-      Write-Host "##vso[task.setvariable variable=week]$week"
-    displayName: "Determine if its the last week of the sprint"
-  - checkout: AzureDevOps
-    fetchDepth: 1
-    persistCredentials: true
-    condition: and(succeeded(), or(eq(variables['WEEK'], '3'), eq(variables['FORCE_COURTESY_PUSH'], 'true')))
-  - checkout: self
-    condition: and(succeeded(), or(eq(variables['WEEK'], '3'), eq(variables['FORCE_COURTESY_PUSH'], 'true')))
-  - template: ci/courtesy-push.yml
+          # Push branch to git
+          Write-Host "Pushing branch to AzureDevOps"
+          cd AzureDevOps
+          git checkout -b $releaseBranch
+          git config --global user.email "$(username)@microsoft.com"
+          git config --global user.name "$(username)"
+          git add .nuget\externals\UnifiedDependencies.xml
+          git add Tfs\Service\Deploy\components\*
+          git commit -m "Courtesy bump of tasks"
+          git push origin $releaseBranch --force
+          Write-Host "Creating Pull Request"
+          cd ..\azure-pipelines-tasks\ci\courtesy-push
+          npm install
+          node open-courtesy-push-pull-request.js $releaseBranch
 
-# Used to notify about fails while courtesy push PR creation
-- job: notify_courtesy_push_fail
-  displayName: Notify courtesy push fail
-  dependsOn:
-  - courtesy_push_windows
-  condition: |
-    and
-    (
-      in(dependencies.courtesy_push_windows.result, 'Failed', 'Skipped'),
-      eq(variables['COURTESY_PUSH'], 'true'),
-      eq(variables['build.reason'], 'Schedule'),
-      eq(variables['COURTESY_PUSH_NOTIFICATION'], 'true')
-    )
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - powershell: |
-      # Notify slack channel about failed courtesy push PR creation
-      $pipelineLink = "$env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI$env:SYSTEM_TEAMPROJECT/_build/results?buildId=$env:BUILD_BUILDID&_a=summary" 
-      $messageText = "Failed to create courtesy push PR. Please review the results of failed build: $($pipelineLink) "
-      $body = '{"text": "'+$($messageText)+'"}'
-      Invoke-RestMethod -Uri $(slackUri) -Method Post -Body $body -ContentType 'application/json'
-    displayName: 'Send notification to the slack channel'
+          # Sleep 30 seconds to let PR be created
+          Start-Sleep -Seconds 30
+    - task: PowerShell@2
+      displayName: Send MS Teams notification
+      condition: eq(variables['build.reason'], 'Schedule')
+      env:
+        TEAMS_WEBHOOK: $(MSTeamsUri)
+      inputs:
+        targetType: inline
+        script: .\azure-pipelines-tasks\ci\courtesy-push\send-notification.ps1
+  - job: build_all_tasks_for_deployments
+    displayName: Build all tasks for deployments (Windows)
+    dependsOn:
+    - courtesy_push
+    condition: succeeded()
+    timeoutInMinutes: 180
+    pool:
+      name: 1ES-Shared-Hosted-Pool_Windows-Server-2022
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        clean: true
+    - task: NodeTool@0
+      displayName: Use node 10
+      inputs:
+        versionSpec: 10.24.1
+    - task: CmdLine@2
+      displayName: npm install
+      inputs:
+        script: npm install
+    - task: CmdLine@2
+      displayName: Clean tasks
+      inputs:
+        script: node make.js clean
+    - task: CmdLine@2
+      displayName: Build tasks
+      inputs:
+        script: node make.js serverBuild
+    - task: CmdLine@2
+      displayName: Stage tasks individually into the package directory
+      inputs:
+        script: node ./ci/stage-package.js true individually
+    - task: CmdLine@2
+      displayName: Remove _build folder to reduce space
+      inputs:
+        script: |
+          rmdir /s /q _build
+          rmdir /s /q _package\nested-zips-layout
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK 6.x'
+      inputs:
+        version: 6.x
+    - task: SFP.build-tasks.custom-build-task-1.EsrpCodeSigning@2
+      inputs:
+        ConnectedServiceName: AzurePipelinesTasksESRP
+        FolderPath: $(Build.SourcesDirectory)\_package\tasks-layout
+        Pattern: '*.zip'
+        signConfigType: inlineSignParams
+        inlineOperation: |
+          [{
+          "keyCode": "CP-401405",
+          "operationSetCode": "NuGetSign",
+          "parameters": [],
+          "toolName": "sign",
+          "toolVersion": "1.0"
+          },
+          {
+          "keyCode": "CP-401405",
+          "operationSetCode": "NuGetVerify",
+          "parameters": [],
+          "toolName": "sign",
+          "toolVersion": "1.0"
+          }
+          ]
+      displayName: Sign Task Nuget Packages
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0), eq(variables.os, 'Windows_NT'))
+    - task: CmdLine@2
+      displayName: Remove CodeSignSummary file from package folder
+      condition: and(succeeded(), ne(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0), eq(variables.os, 'Windows_NT'))
+      inputs:
+        script: del $(Build.SourcesDirectory)\_package\tasks-layout\CodeSignSummary*.md
+    - task: CmdLine@2
+      displayName: Stage all the tasks into a single zip for upload
+      inputs:
+        script: node ./ci/stage-package.js true
+    - task: PublishBuildArtifacts@1
+      displayName: Publish package artifact
+      inputs:
+        pathToPublish: _package/tasks.zip
+        artifactName: allTasks
+        publishLocation: container
+  - job: build_all_linux
+    displayName: Build all tasks (Linux)
+    condition: eq(variables.os, 'Linux')
+    timeoutInMinutes: 180
+    pool:
+      vmImage: ubuntu-20.04
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        clean: true
+    - task: NodeTool@0
+      displayName: Use node 10
+      inputs:
+        versionSpec: 10.24.1
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK 7.x'
+      inputs:
+        version: 7.x
+    - task: CmdLine@2
+      displayName: npm install
+      inputs:
+        script: npm install
+    - task: CmdLine@2
+      displayName: npm install min agent demands
+      inputs:
+        script: |
+          cd ci/verifyMinAgentDemands
+          npm install
+    - task: CmdLine@2
+      displayName: Verify min agent demands
+      inputs:
+        script: node ./ci/verifyMinAgentDemands/index.js
+    - task: PowerShell@2
+      displayName: Fetch current sprint
+      inputs:
+        targetType: inline
+        script: |
+          $currentSprintData = (Invoke-WebRequest https://whatsprintis.it -Headers @{"Accept"="application/json"} | ConvertFrom-Json)
+          $currentSprint = [int]$currentSprintData.sprint
+          $currentSprintWeek = [int]$currentSprintData.week
+          echo "##vso[task.setvariable variable=currentSprint;]$currentSprint"
+          echo "##vso[task.setvariable variable=currentSprintWeek;]$currentSprintWeek"
+    - task: CmdLine@2
+      displayName: Filter out unchanged tasks
+      env:
+        PACKAGE_ENDPOINT: $(Package.Endpoint)
+        PACKAGE_TOKEN: $(Package.Token)
+      inputs:
+        script: node ./ci/filter-tasks.js
+    - task: CmdLine@2
+      displayName: Check that tasks has no duplicated libs
+      condition: and(succeeded(), eq(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/before-build-check-tasks.js
+    - task: CmdLine@2
+      displayName: Check for downgrading tasks
+      condition: |
+        and(
+          succeeded(),
+          ne(variables['numTasks'], 0),
+          ne(variables['COURTESY_PUSH'], 'true'),
+          eq(variables['build.reason'], 'PullRequest'),
+          eq(variables['System.PullRequest.TargetBranch'], 'master')
+        )
+      env:
+        PACKAGE_TOKEN: $(Package.Token)
+      inputs:
+        script: node ./ci/check-downgrading.js --task "$(task_pattern)" --sprint $(currentSprint) --week $(currentSprintWeek)
+    - task: DotNetCoreCLI@2
+      displayName: Build BuildConfigGen
+      inputs:
+        command: build
+        projects: './BuildConfigGen/BuildConfigGen.csproj'
+    - task: CmdLine@2
+      displayName: Clean tasks
+      inputs:
+        script: node make.js clean
+    - task: CmdLine@2
+      displayName: Build Tasks
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js serverBuild --task "$(task_pattern)"
+    - task: CmdLine@2
+      displayName: Check that tasks has no duplicated libs
+      condition: and(succeeded(), eq(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/after-build-check-tasks.js
+    - task: CmdLine@2
+      displayName: Verify task source changes
+      condition: "and(\n  succeeded(),\n  ne(variables['Build.SourceBranch'], 'refs/heads/master'),     \n  ne(variables['COURTESY_PUSH'], 'true'),\n  ne(variables['numTasks'], 0)\n)\n"
+      inputs:
+        script: node ./ci/verify-source-changes.js "$(task_pattern)"
+    - task: CmdLine@2
+      displayName: Run tests
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js test
+    - task: CmdLine@2
+      displayName: Legacy tests with node 6
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js testLegacy --task "$(task_pattern)"
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish Code Coverage Results
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(System.DefaultWorkingDirectory)/_build/coverage/*coverage.xml
+  - job: build_all_darwin
+    displayName: Build all tasks (macOS)
+    condition: eq(variables.os, 'Darwin')
+    timeoutInMinutes: 180
+    pool:
+      vmImage: macos-11
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        clean: true
+    - task: NodeTool@0
+      displayName: Use node 10
+      inputs:
+        versionSpec: 10.24.1
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK 7.x'
+      inputs:
+        version: 7.x
+    - task: CmdLine@2
+      displayName: npm install
+      inputs:
+        script: npm install
+    - task: CmdLine@2
+      displayName: npm install min agent demands
+      inputs:
+        script: |
+          cd ci/verifyMinAgentDemands
+          npm install
+    - task: CmdLine@2
+      displayName: Verify min agent demands
+      inputs:
+        script: node ./ci/verifyMinAgentDemands/index.js
+    - task: PowerShell@2
+      displayName: Fetch current sprint
+      inputs:
+        targetType: inline
+        script: |
+          $currentSprintData = (Invoke-WebRequest https://whatsprintis.it -Headers @{"Accept"="application/json"} | ConvertFrom-Json)
+          $currentSprint = [int]$currentSprintData.sprint
+          $currentSprintWeek = [int]$currentSprintData.week
+          echo "##vso[task.setvariable variable=currentSprint;]$currentSprint"
+          echo "##vso[task.setvariable variable=currentSprintWeek;]$currentSprintWeek"
+    - task: CmdLine@2
+      displayName: Filter out unchanged tasks
+      env:
+        PACKAGE_ENDPOINT: $(Package.Endpoint)
+        PACKAGE_TOKEN: $(Package.Token)
+      inputs:
+        script: node ./ci/filter-tasks.js
+    - task: CmdLine@2
+      displayName: Check that tasks has no duplicated libs
+      condition: and(succeeded(), eq(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/before-build-check-tasks.js
+    - task: CmdLine@2
+      displayName: Check for downgrading tasks
+      condition: |
+        and(
+          succeeded(),
+          ne(variables['numTasks'], 0),
+          ne(variables['COURTESY_PUSH'], 'true'),
+          eq(variables['build.reason'], 'PullRequest'),
+          eq(variables['System.PullRequest.TargetBranch'], 'master')
+        )
+      env:
+        PACKAGE_TOKEN: $(Package.Token)
+      inputs:
+        script: node ./ci/check-downgrading.js --task "$(task_pattern)" --sprint $(currentSprint) --week $(currentSprintWeek)
+    - task: DotNetCoreCLI@2
+      displayName: Build BuildConfigGen
+      inputs:
+        command: build
+        projects: './BuildConfigGen/BuildConfigGen.csproj'
+    - task: CmdLine@2
+      displayName: Clean tasks
+      inputs:
+        script: node make.js clean
+    - task: CmdLine@2
+      displayName: Build Tasks
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js serverBuild --task "$(task_pattern)"
+    - task: CmdLine@2
+      displayName: Check that tasks has no duplicated libs
+      condition: and(succeeded(), eq(variables['build.reason'], 'PullRequest'), ne(variables['numTasks'], 0))
+      inputs:
+        script: node ./ci/after-build-check-tasks.js
+    - task: CmdLine@2
+      displayName: Verify task source changes
+      condition: "and(\n  succeeded(),\n  ne(variables['Build.SourceBranch'], 'refs/heads/master'),     \n  ne(variables['COURTESY_PUSH'], 'true'),\n  ne(variables['numTasks'], 0)\n)\n"
+      inputs:
+        script: node ./ci/verify-source-changes.js "$(task_pattern)"
+    - task: CmdLine@2
+      displayName: Run tests
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js test
+    - task: CmdLine@2
+      displayName: Legacy tests with node 6
+      condition: and(succeeded(), ne(variables['numTasks'], 0))
+      inputs:
+        script: node make.js testLegacy --task "$(task_pattern)"
+    - task: PublishCodeCoverageResults@1
+      displayName: Publish Code Coverage Results
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: $(System.DefaultWorkingDirectory)/_build/coverage/*coverage.xml
 
-# All tasks on Linux
-- job: build_all_linux
-  displayName: Build all tasks (Linux)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Linux'))
-  pool:
-    vmImage: ubuntu-18.04
-  steps:
-  - template: ci/build-all-steps.yml
-    parameters:
-      os: Linux
-
-# All tasks on macOS
-- job: build_all_darwin
-  displayName: Build all tasks (macOS)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Darwin'))
-  pool:
-    vmImage: macos-10.15
-  steps:
-  - template: ci/build-all-steps.yml
-    parameters:
-      os: Darwin
-
-# Single task
-- job: buildSingle
-  displayName: Build single task
-  condition: and(succeeded(), variables.task)
-  steps:
-  - template: ci/build-single-steps.yml
-
-- job: buildSharedNpm_win
-  displayName: Build shared npm packages (Win)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Windows_NT'))
-  pool:
-    vmImage: vs2017-win2016
-  steps:
-  - template: ci/build-common-npm.yml
-
-- job: buildSharedNpm_linux
-  displayName: Build shared npm packages (Linux)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Linux'))
-  pool:
-    vmImage: ubuntu-18.04
-  steps:
-  - template: ci/build-common-npm.yml
-
-- job: buildSharedNpm_darwin
-  displayName: Build shared npm packages (macOS)
-  condition: and(succeeded(), not(variables.task), eq(variables.os, 'Darwin'))
-  pool:
-    vmImage: macos-10.15
-  steps:
-  - template: ci/build-common-npm.yml
