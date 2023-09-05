@@ -8,9 +8,9 @@ resources:
   repositories:
   - repository: AzureDevOps
     type: git
-    endpoint: AzureDevOps
-    name: AzureDevOps/AzureDevOps
-  - repository: ConfigChange
+    endpoint: v-vjankovic0540
+    name: v-vjankovic0540
+  - repository: v-vjankovic0540
     type: git
     endpoint: AzureDevOps
     name: AzureDevOps/AzureDevOps.ConfigChange
