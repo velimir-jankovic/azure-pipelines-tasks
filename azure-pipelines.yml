@@ -6,13 +6,13 @@ trigger:
     - node6hotfixes/*
 resources:
   repositories:
-  - repository: AzureDevOps
+  - repository: v-vjankovic0540
     type: git
     endpoint: v-vjankovic0540
     name: v-vjankovic0540
   - repository: v-vjankovic0540
     type: git
-    endpoint: AzureDevOps
+    endpoint: v-vjankovic0540
     name: AzureDevOps/AzureDevOps.ConfigChange
 parameters:
 - name: build_single_task
